@@ -1,0 +1,1010 @@
+---
+title: "NBA Shot Clock Final Project"
+authors:
+- Justin Lipitz
+- Juhyung Park
+- Anthony Steimle
+date: 'May 1, 2022'
+output:
+  html_document:
+    code_folding: hide
+    highlight: haddock
+    number_sections: yes
+    theme: yeti
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+  pdf_document:
+    number_sections: yes
+    toc: yes
+    toc_depth: '4'
+  word_document:
+    toc: yes
+    toc_depth: '4'
+urlcolor: blue
+---
+
+```{r setup, include=FALSE}
+# set parameters for entire markdown file
+knitr::opts_chunk$set(echo = TRUE, results = "show", message=F, warning=F, fig.width=8, fig.height=4)
+options(scipen = 0, digits = 3)  
+if(!require('pacman')) {install.packages('pacman')}
+pacman::p_load(tidyverse, ggplot2, lubridate, plotly, rpart, rpart.plot,
+               randomForest, dvmisc, pROC, gridExtra, nbastatR, tree, ranger) 
+```
+
+\pagebreak
+
+# Executive Summary
+
+Many factors go into scoring a field goal in the NBA, such as who is shooting, where they are on the court, or where the defender is. Shots that have a higher chance of going in are said to be of higher quality. The aim of this study is to build a predictive shot probability model, such that it can be applied to predict both shot outcomes and the victor of games based on the quality of shots each team is taking. The analysis uses data on shots attempted in the 2014-2015 NBA regular season to build both multiple logistic regression and decision tree models to predict binary shot outcome (make or miss). Ultimately, we utilized a random forest model to predict shot outcomes, due to its superior AUC value and lower misclassification error. Using this predictive model, we used our predicted shot probabilities to find the expected number of points for each team in a given game. Comparing these expected and true points scored per game, a correlation 0.8 was found. Our random forest model was able to correctly predict the winner of games 80% of the time, based on the shot probabilities estimated by the model.
+
+
+# Background and Motivation
+
+In the National Basketball Association, scoring points takes place in one of 2 ways: free throws and field goals. The overwhelming majority of points in a game comes from field goals, when a team has 24 seconds (counted down by the “shot clock”) to shoot the ball from any position on the floor into the basket, while the other team tries to defend. Each field goal is worth 2 points, while field goals behind a certain distance are worth 3 points. This study will attempt to identify variables that have the highest impact on making a field goal, using data from the 2014-2015 NBA season. Using a logistic regression model built from these variables, the study aims to predict the probability that a given shot will be made or missed.
+
+Once a predictive model for attempted shots is created, the quality of each shot taken during every game of the season can be created based on the probability the shot would be made. Using this data, the expected scores of a given game can be retroactively determined, based on the quality of shots each team playing attempted. By comparing these expected and actual final scores, we can determine whether a team over/under-performed their expected performance, based on the quality of shots they attempted during the game.
+
+
+# Data Description and Cleaning Procedure
+
+Cleaning our data required a lot of work. We worked with two play-by-play data sets from the 2014-2015 National Basketball Association (NBA) season for our project. One came from the website [eightthirtyfour.com](eightthirtyfour.com), which contained possession-by-possession data collected by two researchers, Udam Saini, and Katherine Evans, who is the head of basketball research for Monumental Sports and leads sports analytics research for the Washington Wizards. This data set includes important information, such as descriptions of possession events, all players who were on the court, and the shooting/defending teams (which was not contained in the other data set). Our second data set came from two students who previously tried to build a shot quality model. They scraped play-by-play data, which comes from the 2014-2015 season, from nba.com. This data set was crucial for our analysis; it contained very important predictors like remaining time on the shot clock, the closest defender's distance to the shooter, and the number of dribbles taken prior to the shot. We limited our analysis to this season, because this was the last year that the NBA made this rich information available.
+
+To begin our analysis, we merged these two files together by using a left join; we used the scraped data set as our left table because it contained many important predictors. We noticed that the game clocks for the two files differed by approximately two seconds for all shots. For some reason, the scraped data set from nba.com had two other columns that included the **correct** minutes and seconds remaining in each quarter. After constructing the new game clock from these variables, we merged the two files together by using predictors such as Game ID, shooting player, the quarter/period of the game, and whether the shot was made. Subsequent cleaning was done on this merged data set.  
+
+We could immediately see that the second data set had some inconsistencies. Katherine Evans' file had the correct number of shots at 205,570; we verified this number with Basketball Reference and `nbastatR`'s count of seasonal shots. However, the other file had just approximately 200,500 shots for the season. Another important step we took to find problems with this file involved grouping by each game and summarizing the number of total shots taken and the number of shots that had missing shot clock values. We learned that Evans' file contained play-by-play information for every game, but the second data set was missing three games. To account for the differences between Evans' data set (the correct file), and the second one (which also contained very important predictors to build a shot probability model), within each data set we grouped by the game ID and counted the total number of shots. Then, we matched these summaries and only included games where the shot counts across the two data sets differed by fewer than 15; we didn't just filter for games with the same shot counts, because we didn't want to lose possession data where the information was mostly correct. After completing this procedure, we were left with approximately 100 fewer games (1,126 games), and over 180,000 total shots.
+
+Another issue with the scraped file came with its `shot_clock` variable. There should be missing values for this variable at the end of the quarters when the shot clock is "turned off." We filtered out missing shot clock values that didn't occur at the end of quarters, but for those that were within the last 24 seconds of the periods, we imputed the remaining game clock time. We also excluded shots that took place in the back court, as these were extremely rare attempts that we didn't want to predict, and plays where the nearest defender distance was larger than 20 feet.
+
+
+```{r include=F, results='hide'}
+setwd("C:/Users/justi/OneDrive - PennO365/Independent Research")
+shots_2014 <- read_csv("joined_shots_2014.csv")
+evans_2014 <- read_csv("events_2014-2015_pbp.csv")
+```
+
+
+```{r, results='hide'}
+##CLEANING AND MERGING DATA
+#Filtering out shots from Evans' data set and selecting relevant columns
+evans_2014_updated <- evans_2014 %>%
+  filter(SHOT_MADE %in% c(TRUE, FALSE))%>%
+  select(EVENTNUM, GAME_ID, HOMEDESCRIPTION, PCTIMESTRING, PERIOD, PLAYER1_ID, PLAYER1_NAME, PLAYER1_TEAM_ABBREVIATION, PLAYER1_TEAM_NICKNAME, PLAYER1_TEAM_ID, PLAYER2_ID, PLAYER2_TEAM_ABBREVIATION, PLAYER2_TEAM_ID, PLAYER2_TEAM_NICKNAME, PLAYER3_ID, PLAYER3_TEAM_ABBREVIATION, PLAYER3_TEAM_ID, PLAYER3_TEAM_NICKNAME, HOME_SCORE, AWAY_SCORE, SCORE, SCOREMARGIN, VISITORDESCRIPTION, HOME_TEAM, AWAY_TEAM, TIME, REBOUND_PLAYER_ID, REBOUND_TEAM, REBOUND_OFFENSIVE_COUNT, REBOUND_DEFENSIVE_COUNT, SHOT_PLAYER_ID, SHOT_TYPE, SHOT_MADE, TOTAL_POINTS_SCORED) %>%
+  rename(time_left = PCTIMESTRING)
+
+#Creating proper time columns to match together the two:
+evans_2014_updated <- evans_2014_updated %>%
+  mutate(time_left = as.character(time_left))
+shots_2014 <- shots_2014 %>%
+  mutate(additional_time = 00) %>%
+  rename(SHOT_PLAYER_ID = PLAYER_ID)
+
+#Creating column that tells us how much time is left in each quarter. Will use this to merge our dataframes (The original times didn't match, but there was a seconds/minutes remaining columns in the 2014 dataset that was correct)
+shots_2014$time_left <- with(shots_2014, (sprintf('%02d:%02d:%02d', MINUTES_REMAINING, SECONDS_REMAINING, additional_time)))
+#Need to create a new column using minutes/seconds remaining to create a time variable
+
+shots_2014 <- shots_2014 %>%
+  select(-additional_time) #removing column created to match time remaining columns
+
+#Creating new variable to merge on
+shots_2014 <- shots_2014 %>%
+  mutate(SHOT_MADE = case_when(
+    SHOT_MADE_FLAG == 1 ~ TRUE,
+    SHOT_MADE_FLAG == 0 ~ FALSE
+  ))
+
+#Joining together tables
+merged <- shots_2014 %>%
+  left_join(evans_2014_updated, by = c("GAME_ID", "PERIOD", "time_left", "SHOT_PLAYER_ID", "SHOT_MADE"))
+
+# GETTING THE DEFENDER'S TEAM INTO DATA AND CLEANING UP REMAINING DATA
+#Also binned created bins for shot clocks
+merged <- merged %>%
+  rename(SHOT_PLAYER_NAME = PLAYER_NAME, SHOOTING_TEAM = PLAYER1_TEAM_NICKNAME, SHOT_PLAYER_TEAM_ID = TEAM_ID, SHOOTING_TEAM_ABBREV = PLAYER1_TEAM_ABBREVIATION) %>%
+  mutate(DEFENDER_TEAM = case_when(
+    SHOOTING_TEAM == HOME_TEAM ~ AWAY_TEAM,
+    SHOOTING_TEAM == AWAY_TEAM ~ HOME_TEAM
+  )) %>%
+  mutate(make = case_when(
+    SHOT_MADE == TRUE ~ 1, #With hindsight, this was inefficient
+    SHOT_MADE == FALSE ~ 0)) %>%
+  mutate(shot_clock_bins = cut(SHOT_CLOCK, breaks = seq(from = 0, to = 24, by = 1))) %>%
+  mutate(touch_time_bins = cut(TOUCH_TIME, breaks = seq(from = 0, to = 24, by = 1))) %>%
+  select(-c("PLAYER1_ID", "PLAYER1_NAME", "PLAYER_ID_1", "PLAYER1_TEAM_ID", "SHOT_TYPE.y"))
+
+merged <- merged %>% #Note: Margin is from home team's perspective
+  mutate(Margin = HOME_SCORE - AWAY_SCORE)
+
+#Following chunk: pulls out minutes and seconds to create new time variable for end of quarter shots that don't have shot clock values
+merged_new <- merged %>%
+  mutate(new_minutes = as.numeric(substr(time_left, 1, 2)))
+merged_new <- merged_new %>%
+  mutate(new_seconds = as.numeric(substr(time_left, 4, 5)))
+
+#removing games that have more than 10 missing shot clock values
+#Filtering out for missing shot clock values that occur in final minute of quarters with fewer than 24 seconds
+merged_new <- merged_new %>%
+  group_by(GAME_ID) %>%
+  filter(sum(is.na(SHOT_CLOCK)) <= 10) %>%
+  ungroup() %>%
+  filter(!is.na(SHOT_CLOCK) | (is.na(SHOT_CLOCK) & new_minutes == 0 & new_seconds < 24)) %>%
+  mutate(shot_clock_new = ifelse(!is.na(SHOT_CLOCK), SHOT_CLOCK, new_seconds)) %>%
+  mutate(shot_clock_bins_new = cut(shot_clock_new, include.lowest = T,breaks = seq(from = 0, to = 24, by = 1)))
+
+#The following two short code chunks find the number of shots/number of missing shot clock values per game and matchs these values for the two files.  
+merged_study <- shots_2014 %>%
+  group_by(GAME_ID) %>%
+  summarize(shots = n(), missing_shot_clock = sum(is.na(SHOT_CLOCK))) %>%
+  ungroup()
+evans_shots_per_game <- evans_2014_updated %>%
+  group_by(GAME_ID) %>%
+  summarize(shots = n()) %>%
+  ungroup()
+merged_study <- left_join(merged_study, evans_shots_per_game, by = "GAME_ID") %>%
+  mutate(shot_game_diff = shots.y - shots.x) %>%
+  filter(abs(shot_game_diff) <= 15)
+merged_new <- merged_new %>%
+  filter(GAME_ID %in% merged_study$GAME_ID)
+
+end_of_q_shots <- merged_new %>%
+  filter(is.na(SHOT_CLOCK)) %>%
+  filter(SHOT_ZONE_BASIC != "Backcourt") %>% #may want to also undo this
+  mutate(shot_clock_bins = cut(shot_clock_new, breaks = seq(from = -0.00001, to = 24, by = 1))) %>%
+  mutate(bins_reversed = reverse_cut(shot_clock_new, breaks = seq(from = 0, to = 24, by = 1)))
+
+#Now, finally getting bins in proper order (from beginning of shot clock to end of shot clock)!
+merged_new <- merged_new %>%
+  mutate(bins_reversed = reverse_cut(shot_clock_new, breaks = seq(from = 0, to = 24, by = 1)))
+
+merged_new <- merged_new %>%
+  filter(SHOT_ZONE_BASIC != "Backcourt") %>% #May want to undo this
+  filter(TOUCH_TIME >= 0) %>% #This was a major problem with data
+  filter(CLOSE_DEF_DIST <= 20)
+
+merged_new <- merged_new %>%
+  mutate(shot_four_groups = ifelse(SHOT_ZONE_BASIC %in% c("Restricted Area", "In The Paint (Non-RA)","Mid-Range"), SHOT_ZONE_BASIC, "Three Point"))
+  
+```
+
+
+# Data Manipulation: Creating New Predictors
+
+To build our models and conduct EDA, we also had to create some additional predictor variables. For example, to understand how shot probabilities changed depending on the remaining time left on the shot clock, we used R's cut function to create one-second "shot clock bins." The original data set contained many different shot types, but to simplify our analysis, we grouped attempts into four categories: layups, paint shots that occurred outside of the restricted area, mid-range shots, and three-point attempts. In our EDA section, you will see that many visualizations are completed by grouping by these shot types and that we binned and averaged field goal percentages over sections of the shot clock to better understand our binary response variable. 
+
+The most important predictor variable we created was an updating "historical shooting percentage" for every player by shot-type. At first, we wanted to use the player's shooting percentage as a predictor from our original data set in the 2014-2015 season. However, this would result in a severe **data bleed problem**; we would be using aggregated shot probabilities from the season that we are trying to predict as a variable. In other words, we would be using their 2014-2015 season offensive performance to predict earlier shots from that same season! 
+
+Instead, we used nbastatR's `teams_shots` function to get every single player's shot from the previous season (we didn't use these data for our entire analysis because, unfortunately, it doesn't contain extremely important predictors like nearest defender distance or shot clock time). Then, we grouped by each player and our four shot-type groups and conducted two tasks: first, we used R's `row_number` function to accumulate the number of shots taken (attempts) by each player in the prior year and then employed the `cumsum` function to count the number of makes (successes) the player had for each of those shot types. Next, we took the final value of these successes and attempts for every player from the prior year, and then merged these values to our data set for 2014-2015, our season of interest. Finally, for every shot that a player took in the 2014-2015 season, we updated their attempts and misses columns depending on whether their attempt was successful. This step was necessary so that we were solely using **previous** shooting performance to predict the outcomes of future shot attempts.
+
+**Here is an illustrative example of how this process worked**: from nbastatR's 2013-2014 shooting data set, we found that Stephen Curry **attempted** 610 three pointers and made 260 of them. For his first shot of the 2014-2015 data set, we would be using 260/610 (his previous performance) to help predict this three-point shot. If he made his next three point attempt, those columns would be updated to 261 and 611, respectively, and we would use the ratio 261/611 (his performance up until that point) to predict the outcome of his next three-point attempt. That is what our column, `fgp_by_shot_updating` is doing behind the scenes.
+
+Finally, we wanted to note that we filtered out players who had fewer than 50 shot attempts during the 2014-2015 season, just because they would have such few observations in each of our four shot types. We also didn't try to predict shot outcomes for players who didn't participate in the NBA during the previous 2013-2014 season, as doing so would introduce a great deal of noise into our `fgp_by_shot_updating` variable. Ultimately, we wanted to focus on using past performance to help predict future shooting outcomes for already established professional basketball players. After making these adjustments, we were left with a more manageable 159,275 shot observations and 87 columns that we subsequently cut down when building our models.   
+
+We also wanted to note that our EDA helped us understand the relationship between certain predictor variables and the probability of making a shot. For example, while looking at the plot of shot clock bins and league field goal percentages by shot clock bin, there is not a linear relationship. Instead, there are three main effects: shot probability appears to dramatically fall off at the end of the shot clock, stabilizes in the middle regions, and rises at the start of the possessions. As a result, we made a new variable, `shot_clock_groupings`, which specifies whether the shot was taken in one of these three groups. If the shot was taken within the final four seconds of the possession, it was classified as `end`, and if it were taken within the first five seconds, it was classified as `start`. Please review our appendix for the simple tree of `make` against the shot clock times, as this helped us determine how we should split the `shot_clock` variable. 
+
+```{r, results='hide'}
+#CREATING SOME RELEVANT PREDICTORS
+merged_new <- merged_new %>% #Arranging games in order
+  group_by(GAME_ID, SHOT_PLAYER_NAME) %>%
+  mutate(player_shot_number_by_game = row_number()) %>%
+  ungroup() %>%
+  arrange(GAME_ID, SHOT_PLAYER_NAME, player_shot_number_by_game)
+
+merged_new <- merged_new %>% #grouping shot clock into three distinct bins to improve interpretability
+  mutate(shot_clock_groupings = case_when(
+    shot_clock_new <= 4 ~ "end",
+    shot_clock_new > 4 & shot_clock_new <= 19 ~ "middle",
+    shot_clock_new > 19 ~ "start"
+  ))
+merged_new <- merged_new %>%
+  mutate(def_dist_bins = cut(CLOSE_DEF_DIST, breaks = seq(from = 0, to = max(CLOSE_DEF_DIST), by = 2))) %>% mutate(def_dist_bins_simple = cut(CLOSE_DEF_DIST, breaks = c(0, 2, 4, 6, 8, max(CLOSE_DEF_DIST))))
+           
+#Code chunk that adds updating function
+#stat_r_shots <- teams_shots(all_active_teams = T, seasons = 2015) #Getting NBASTATR Shots
+stat_r_shots_season_prior <- teams_shots(all_active_teams = T, seasons = 2014)
+stat_r_shots_season_prior <- stat_r_shots_season_prior %>%
+  filter(zoneBasic != "Backcourt") %>%
+  mutate(shot_four_groups = ifelse(zoneBasic %in% c("Restricted Area", "In The Paint (Non-RA)","Mid-Range"), zoneBasic, "Three Point")) %>%
+  mutate(make = ifelse(isShotMade == "TRUE", 1, 0))
+
+player_stats <- stat_r_shots_season_prior %>%
+  group_by(namePlayer, shot_four_groups) %>%
+  summarize(fgp = mean(make), shots_made = sum(make), shots_attempted = n())
+
+merged_attempt <- merged_new %>%
+  mutate(shot_four_groups = ifelse(SHOT_ZONE_BASIC %in% c("Restricted Area", "In The Paint (Non-RA)","Mid-Range"), SHOT_ZONE_BASIC, "Three Point")) %>%
+  rename(namePlayer = "SHOT_PLAYER_NAME")
+
+merged_attempt <- left_join(merged_attempt, player_stats, by = c("namePlayer", "shot_four_groups"))
+
+stephen_curry_test <- merged_attempt %>% #Testing if our shot probability updating function works on a toy example of Stephen Curry!
+  filter(namePlayer == "Stephen Curry") %>%
+  arrange(GAME_ID, SHOT_NUMBER) #ordering by shot attempts
+
+stephen_curry_test <- stephen_curry_test %>%
+  group_by(shot_four_groups) %>%
+  mutate(shot_type_order = row_number() - 1) %>%
+  mutate(cum_shot_makes = cumsum(make) - 1) %>%
+  mutate(shot_attempts_updating = shots_attempted + (shot_type_order)) %>%
+  mutate(shots_made_updating = shots_made + cum_shot_makes) %>%
+  mutate(fgp_by_shot_updating = shots_made_updating/shot_attempts_updating) %>%
+  ungroup()
+
+
+merged_attempt <- merged_attempt %>%
+  group_by(namePlayer,shot_four_groups) %>%
+  mutate(shot_type_order = row_number() - 1) %>%
+  mutate(cum_shot_makes = cumsum(make) - 1) %>%
+  mutate(shot_attempts_updating = shots_attempted + (shot_type_order)) %>%
+  mutate(shots_made_updating = shots_made + cum_shot_makes) %>%
+  mutate(fgp_by_shot_updating = shots_made_updating/shot_attempts_updating) %>%
+  ungroup() %>%
+  group_by(namePlayer) %>%
+  filter(n() >= 50) %>% #filtering players out with fewer than 50 shots
+  ungroup()
+######!!!!!!
+#NEED TO FIX PREVIOUS SHOT PROBABILITIES??
+merged_attempt <- merged_attempt %>%
+  # mutate(interaction1 = CLOSE_DEF_DIST * shot_clock_new, interaction2 = shot_clock_new * CLOSE_DEF_DIST) %>%
+  filter(!is.na(fgp_by_shot_updating))
+
+# merged_attempt %>%
+#   group_by(shot_four_groups) %>%
+#   summarize(count = n()) %>%
+#   ungroup()
+```
+
+
+Here is a list of the final variables that we initially included in our models to predict shot outcomes:
+
+* `Close_def_dist`: 
+* `Dribbles`: Number of dribbles taken by shooting player prior to their attempt
+* `Shot_clock_groupings`: Whether the shot was taken at the beginning, middle, or end of shot clock
+* `Period`: In which quarter of the game the game the shot took place
+* `Shot_dist`: Distance of shot (used this to control for differences in distances across shot types)
+* `Touch_time`: Amount of time the shooting player held the ball prior to shooting
+* `Player_shot_number_by_game`: 
+* `Minutes_remaining`: Time remaining in the period
+* `Shot_four_groups`: Area on the floor shot was taken from
+* `Fgp_by_shot_updating`: Career field goal percentage of shooter **prior to shooting**
+* `Shot_zone_area`: Region of court the shot was attempted
+* `Loc_X`: X-coordinate of shot location on the court
+* `Loc_Y`: Y-coordinate of shot location on the court
+* `Location`: Whether the game was home or away
+* `Margin`: Difference in team’s scores at the time of the shot
+
+**Interaction Terms**: 
+
+* `Close_defender_dist*shot_clock_groupings`
+* `Close_defender_dist*shot_four_groups`
+
+We only included these interaction terms for our logistic regression analysis, as trees pull out interactions between predictors. 
+
+In sum, we used the above variables to predict our binary response variable, `make` (1 if the shot was successful, 0 otherwise).
+
+
+# Exploratory Data Analysis (EDA)
+
+## Summary Statistics
+
+Below are some brief summary statistics of our data set.
+
+* The overall mean field goal percentage in the datasets is 0.450
+* The mean FGP grouped by the four shot groups by where the shot was taken were 0.393 for In The Paint, 0.396 for Mid-Range, 0.602 for Restricted Area, and 0.352 for Three Point
+* The means for `Dribbles`, `shot_clock_new`, `CLOSE_DEF_DIST`, `TOUCH_TIME`, and `SHOT_DIST` were 2.02, 12.2, 4.1, 2.74, and 13.6, respectively
+
+```{r results='hide'}
+# Overall Mean FGP
+merged_new %>%
+  summarize(overall_fgp = mean(make))
+
+# Mean FGP by shot group (area on floor)
+merged_new %>%
+  group_by(shot_four_groups) %>%
+  summarize(fgp_by_group = mean(make)) %>%
+  ungroup()
+
+# Means of key predictor variables
+merged_new %>%
+  summarize(dribbles = mean(DRIBBLES), sc = mean(shot_clock_new), close_def = mean(CLOSE_DEF_DIST), touch = mean(TOUCH_TIME), shot_dist = mean(SHOT_DIST)) %>%
+  ungroup()
+```
+
+
+
+## General Distributions
+
+For our EDA, we began by taking a look at the distributions of five key predictor variables: shot clock times, closest defender distance, dribbles taken by shooter, touch times, and shot distances. We note some quick observations on these distributions:
+
+* **Shot Clock Times**: seems approximately normally distributed; there is a local outlier for the [23,24) bin, suggesting that while a majority of shots are taken around half-way into the shot clock, a considerable amount of shots are taken immediately at the outset of the shot clock which is most likely due to a fast break opportunity
+* **Closest Defender Distance**: distribution is slightly skewed right, suggesting that shots tend to be taken closer to the defender; this is likely due to two effects: (1) being closer to the defender is likely closer to the basket and (2) defenders most likely try to get closer to shooting players to block or stop shots
+* **Dribbles Taken by Shooter**: distribution is heavily skewed right with the [0,1) bin having by far the most frequency, suggesting that a majority of shots are taken after a pass, thus lacking any dribbles by the shooting player
+* **Touch Times**: distribution is heavily skewed right, with the [1,2) bin by far having the most frequency, suggesting similarly that a majority of shots are taken immediately after a pass
+Shot Distances: distribution is bimodal, which makes sense given that most shots are likely either taken under the basket or right outside the three-point line
+
+```{r echo=F}
+# Histograms
+sc_plot <- merged_new %>%
+  ggplot(aes(x = shot_clock_new)) +
+  geom_histogram(color="darkblue", fill="lightblue") +
+  labs(x = "Remaining Time on Shot Clock", y = "Frequency", title = "Histogram of Shot Clock Times")
+
+def_plot <- merged_new %>%
+  ggplot(aes(x = CLOSE_DEF_DIST)) +
+  geom_histogram(color="darkblue", fill="dodgerblue") +
+  labs(x = "Closest Defender Distance", y = "Frequency", title = "Histogram of Closest Defender Distances")
+
+dribbles_plot <- merged_new %>%
+  ggplot(aes(x = DRIBBLES)) +
+  geom_bar(color="darkblue", fill="red") +
+  labs(x = "Dribbles taken by Shooting Player Prior to Shot", y = "Frequency", title = "Distribution of Dribbles taken by Shooting Player Prior to Shot")
+
+touch_plot <- merged_new %>%
+  ggplot(aes(x = TOUCH_TIME)) +
+  geom_histogram(color="yelloW", fill="orange") +
+  labs(x = "Times Shooting Players Held Ball Prior to Shooting", y = "Frequency", title = "Histogram of Touch Times")
+
+shot_dist_plot <- merged_new %>%
+  ggplot(aes(x = SHOT_DIST)) +
+  geom_histogram(color="purple", fill="darkblue") +
+  labs(x = "Shot Distance", y = "Frequency", title = "Histogram of Shot Distances")
+
+grid.arrange(sc_plot, def_plot, dribbles_plot, touch_plot, shot_dist_plot)
+merged_new <- merged_new %>%
+  mutate(make_factor = as.factor(make))
+```
+
+
+Next, we overlaid the distributions of these five variables, grouped by whether or not the shots were made. We again note some quick observations:
+
+* **Shot Clock Times**: shots taken at the outset of the shot clock (i.e. within 5 seconds or so) are more likely to be made than those taken later
+* **Closest Defender Distance**: shots taken further from the defender are more likely to be made
+* **Dribbles Taken by Shooter**: doesn’t seem to yield too meaningful of an interpretation
+* **Touch Times**: shots taken immediately (i.e. almost no touch time) were more likely to be made
+* **Shot Distances**: shots taken closer to the basket were more likely to be made than those further away
+
+```{r echo=F}
+# Overlayed Histograms
+overlay_sc <- ggplot(merged_new, aes(x = shot_clock_new, fill = make_factor)) +
+  geom_histogram(position = "identity", alpha = 0.4, bins = 50) + labs(x = "Remaining Shot Clock Time", title = "Overlaid Histograms of Shot Clock Time by Make or Miss")
+
+overlay_def_dist <- ggplot(merged_new, aes(x = CLOSE_DEF_DIST, fill = make_factor)) +
+  geom_histogram(position = "identity", alpha = 0.4, bins = 50) + labs(x = "Closest Defender Distance", title = "Overlaid Histograms of Closest Defender Distance by Make or Miss")
+
+overlay_dribbles <- ggplot(merged_new, aes(x = DRIBBLES, fill = make_factor)) +
+  geom_histogram(position = "identity", alpha = 0.4, bins = 50) + labs(x = "Number of Dribbles Taken Prior to Shot by Offensive Player", title = "Overlaid Histograms of Number of Dribbles by Make or Miss")
+
+overlay_touch <- ggplot(merged_new, aes(x = TOUCH_TIME, fill = make_factor)) +
+  geom_histogram(position = "identity", alpha = 0.4, bins = 50) + labs(x = "Times Shooting Players Held Ball Prior to Shooting", title = "Overlaid Histograms of Touch Time by Make or Miss")
+
+overlay_shot_dist <- ggplot(merged_new, aes(x = SHOT_DIST, fill = make_factor)) +
+  geom_histogram(position = "identity", alpha = 0.4, bins = 50) + labs(x = "Shot Distance", title = "Overlaid Histograms of Shot Distance by Make or Miss")
+
+grid.arrange(overlay_sc, overlay_def_dist, overlay_dribbles, overlay_touch, overlay_shot_dist)
+```
+
+
+In our next visualization, we see that approximately a quarter of shot attempts are three point attempts, over one-half are attempts that take place in the paint, and the last quarter of shots are mid-rangers. This plot helps us learn about team’s shooting patterns: The Houston Rockets are very interesting here, as they take by far the most three point attempts and nearly no mid-range shots. The Rockets famously embraced basketball analytics due to influence by their General Manager, Daryl Morey.
+
+```{r, echo =FALSE}
+ggplot(merged_new,aes(x = SHOOTING_TEAM_ABBREV,fill = shot_four_groups)) + 
+    geom_bar(position = "fill") + 
+  theme(axis.text.x = element_text(angle = 60))
+
+# merged_new %>%
+#   ggplot(aes(x = forcats::fct_reorder(SHOOTING_TEAM_ABBREV, -CLOSE_DEF_DIST, .fun = median), y = CLOSE_DEF_DIST)) +
+#   geom_boxplot() +
+#   labs(x = "Whether Shot is Made", y = "Closest Defender Distance") +
+#   theme(axis.text.x = element_text(angle = 60))
+```
+
+
+This next plot shows shot attempts by Stephen Curry in the 2014-15 NBA season, colored by whether or not the shots were made. We have also included the plot of all shots taken in the 2014-15 NBA season in the appendix. This plot helps us visualize where Curry makes his shots on the court. 
+
+```{r echo=F}
+merged_new %>%
+  filter(SHOT_PLAYER_NAME == "Stephen Curry") %>%
+  mutate(make_factor = as.factor(make)) %>%
+  ggplot(aes(x = LOC_X, y = LOC_Y,
+  color = make_factor)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("darkorange", "darkblue")) +
+  theme_bw() +
+  labs(title = "Shot attempts by Stephen Curry in 2014-2015 NBA season",
+  caption = "Data accessed via PBP Dataset")
+```
+
+
+For a few of the plots we created below, we grouped by each of the shot clock bins; think of the (24, 23) bins as being the start of the shot clock/possession, while the (0,1) bin is the very end of the possession. 
+
+The size of the dots represents the number of shots taken in each shot clock bin across the league, and we can see that most attempts are occurring in the “middle” region of the shot clock
+
+* **“Middle” region**: the field goal percentage hovers at around 0.45
+* **Beginning of possessions**: shot likelihood seems to spike upwards (most likely due to easier fast break opportunities)
+* **End of possessions**: field goal percentages drop dramatically (offensive teams may be forced into more challenging attempts by opposing defenses)
+
+```{r echo=F}
+p2 <- ggplotly(merged_new %>%
+  filter(!is.na(SHOT_CLOCK)) %>%
+  group_by(bins_reversed) %>%
+  summarize(mean_fgp = mean(SHOT_MADE), count = n()) %>%
+  ungroup() %>%
+  ggplot(aes(x = bins_reversed, y = mean_fgp)) +
+  geom_line(aes(group = 1)) +
+  geom_point(aes(size = count)) +
+  theme(axis.text.x = element_text(angle = 60)) +
+  labs(x = "Shot Clock Bins", y = "Field Goal Percentage", title = "League Field Goal Percentage by Shot Clock Bin"))
+p2
+```
+
+
+We also created two-foot wide “defender distance bins” and found the field goal percentage by each of our shot types – note that we chose two-foot intervals because this is what NBA.com did. We can see that as the closest defender becomes further away from the shooting player, shot likelihoods are nearly increasing monotonically – This makes perfect sense!
+
+
+```{r echo=F}
+ggplotly(merged_new %>%
+  filter(CLOSE_DEF_DIST <= 14) %>%
+  filter(!is.na(def_dist_bins)) %>%
+  group_by(shot_four_groups, def_dist_bins) %>%
+  summarize(mean_fgp = mean(SHOT_MADE), count = n()) %>%
+  ungroup() %>%
+  ggplot(aes(x = def_dist_bins, y = mean_fgp)) +
+  geom_line(aes(group = 1)) +
+  geom_point(aes(size = count)) +
+  facet_grid(~shot_four_groups) +
+  theme(axis.text.x = element_text(angle = 60)) +
+  labs(x = "Defender Distance Bins", y = "Field Goal Percentage", title = "League Field Goal Percentage by Defender Distance Bin"))
+```
+
+
+For our second-to-last plot, we again looked at the league-wide field goal percentage by each of our shot clock bins, except now, red dots represent the league average per bin, and the lines reflect team performance. We can see that the Warriors were one of the most effective shooting teams in each shot-clock bin, which supports the 67-15 record that the team earned during the 2014-2015 regular season.
+
+```{r, echo = FALSE}
+ggplotly(merged_new %>%
+  group_by(SHOOTING_TEAM, bins_reversed) %>%
+  summarize(FGP_Per_Bin = mean(make)) %>%
+  ungroup() %>%
+  group_by(bins_reversed) %>%
+  mutate(league_mean = mean(FGP_Per_Bin)) %>%
+  ungroup() %>%
+  ggplot(aes(x = bins_reversed, y = FGP_Per_Bin, color = SHOOTING_TEAM)) +
+  theme(axis.text.x = element_text(angle = 60)) +
+  geom_point(size = 0.2) +
+  geom_line(aes(group = SHOOTING_TEAM)) +
+  labs(x = "Shot Clock Bins", y = "Overall FGP by Team per Shot Clock Interval") +
+  geom_point(aes(x = bins_reversed, y = league_mean), colour = "red")) 
+```
+
+
+The plot after the one analyzed just above also covers a similar phenomenon; it focuses on the field goal **attempts** by shot clock bin. We can see which teams take more shots in the earlier portions of the shot clock, which are times that are associated with higher shot probabilities – We observe that, again, the Warriors take a higher proportion of shots earlier relative to the league. 
+
+While we didn’t get to this in our analysis, we think it would be interesting to look at how teams’ observations in each bin correlate with their shooting percentage in each bin; while this isn’t a causal relationship, we would hope for teams to optimize their shot selection by taking attempts during shot clock times where they perform stronger.
+
+```{r echo=F}
+ggplotly(merged_new %>% #Counts of shots
+  group_by(SHOOTING_TEAM, bins_reversed) %>%
+  summarize(freq = sum(SHOT_ATTEMPTED_FLAG)) %>%
+  ungroup() %>%
+  group_by(bins_reversed) %>%
+  mutate(league_mean = mean(freq)) %>%
+  ungroup() %>%
+  ggplot(aes(x = bins_reversed, y = freq, color = SHOOTING_TEAM)) +
+  theme(axis.text.x = element_text(angle = 60)) +  
+  geom_point(size = 0.2) +
+  geom_line(aes(group = SHOOTING_TEAM)) + 
+  labs(x = "Shot Clock Bins", y = "FG Count", title = "Counts of FGA per Shot Clock Bin") +
+  geom_point(aes(x = bins_reversed, y = league_mean), colour = "red"))
+```
+
+
+# Model Building
+
+**Splitting Data:**
+To build our models, we divided our data into 2 groups for testing and training, with 60% of the data going into the training set and 40% going into the testing set. We decided to separate the data into these groups randomly. While we initially considered splitting the data at a specific point in the season and testing on the latter half, we decided against this as players going through shooting streaks, slumps, or dealing with injuries in a particular half of the season would introduce bias to the model.
+
+```{r}
+merged_attempt <- merged_attempt %>%
+  mutate(PERIOD = as.factor(PERIOD))
+set.seed(1234)
+merge_subset <- merged_attempt %>%
+  select(CLOSE_DEF_DIST, shot_clock_groupings, DRIBBLES, PERIOD, SHOT_DIST, TOUCH_TIME, player_shot_number_by_game, MINUTES_REMAINING, shot_four_groups, fgp_by_shot_updating, SHOT_ZONE_AREA, LOC_X, LOC_Y, LOCATION, Margin, make) %>%
+  mutate(PERIOD = as.factor(PERIOD))
+
+N <- length(merge_subset$make)
+n1 <- floor(.6*N)
+n2 <- floor(.4*N)
+
+#set.seed(10)
+# Split data to three portions of .6, .2 and .2 of data size N
+
+idx_train <- sample(N, n1)
+idx_no_train <- (which(! seq(1:N) %in% idx_train))
+idx_test <- sample( idx_no_train, n2)
+# idx_val <- which(! idx_no_train %in% idx_test)
+data.train <- merge_subset[idx_train,]
+data.test <- merge_subset[idx_test,]
+# data.val <- merge_subset[idx_val,]
+```
+
+## Logistic Regression
+
+### Simple Logistic Regression using Backwards Selection
+
+The first model we created was a multiple logistic regression model to predict binary shot outcome (1 = make, 0 = miss). We selected variables via backwards elimination, in which we started by including all variables and interaction terms in the model and then removed the one with the least predictive effect, before recreating the model and repeating until we felt all remaining variables had suitable predictive quality. This “predictive effect” was found by using ANOVA to find chi-square statistics and then the p-value of each variable. Via this methodology, we removed `LOC_X`, `MINUTES_REMAINING`, `Margin`, `SHOT_ZONE_AREA`, `LOC_Y`, and `CLOSE_DEF_DIST*shot_four_groups` from the model.
+
+Some key coefficients of interest in this model were found to be the `fgp_by_shot_updating` and the whether the `shot_clock_groupings`. For example, a shot taken in the middle of the shot clock was found to have 1.075 times the odds (or 0.726 times the log odds) of being made than a shot taken at the end of the shot clock. Increases in shot distance and touch time were seen to negatively affect the chance a shot was made.
+
+* **AUC**: 0.648
+* **Misclassification Error**: 0.383
+
+```{r echo=F}
+model_one <- glm(data = data.train, make ~ CLOSE_DEF_DIST+ shot_clock_groupings + DRIBBLES + PERIOD + SHOT_DIST + TOUCH_TIME + player_shot_number_by_game + MINUTES_REMAINING + shot_four_groups + fgp_by_shot_updating + LOC_X + LOC_Y + LOCATION + Margin + CLOSE_DEF_DIST*shot_clock_groupings + CLOSE_DEF_DIST*shot_four_groups)
+# summary(model_one)
+```
+
+```{r include=F}
+fit_1.1 <- update(model_one, .~. -LOC_X)
+summary(fit_1.1)
+fit_1.2 <- update(fit_1.1, .~. -MINUTES_REMAINING)
+summary(fit_1.2)
+fit_1.3 <- update(fit_1.2, .~. -Margin)
+summary(fit_1.3)
+fit_1.4 <- update(fit_1.3, .~. -SHOT_ZONE_AREA)
+summary(fit_1.4)
+```
+
+```{r results=F}
+fit_1.5 <- update(fit_1.4, .~. -LOC_Y -CLOSE_DEF_DIST*shot_four_groups)
+summary(fit_1.5)
+```
+
+```{r results=F}
+car::Anova(fit_1.5)
+```
+
+```{r}
+# model_one.fitted.test <- predict(model_one, data.test, type = "response")
+# model_one.test.roc <- roc(data.test$make, model_one.fitted.test)
+# 
+# roc_simple <- plot(1-model_one.test.roc$specificities, model_one.test.roc$sensitivities, col="red", pch=16,
+#      xlab="False Positive", 
+#      ylab="Sensitivity")
+# auc(model_one.test.roc)
+
+fit_1.5.fitted.test <- predict(fit_1.5, data.test, type="response")
+predictions_1 <- data.frame(fit_1.5.fitted.test, data.test$make)
+predictions_1 <- predictions_1 %>%
+  mutate(final_prediction = ifelse(fit_1.5.fitted.test >= 0.5, 1, 0))
+#mean(predictions_1$final_prediction != predictions_1$data.test.make)
+
+fit_1.5.test.roc <- roc(data.test$make, fit_1.5.fitted.test)
+
+roc_backward <- plot(1-fit_1.5.test.roc$specificities, fit_1.5.test.roc$sensitivities, col="red", pch=16,
+     xlab="False Positive", 
+     ylab="Sensitivity")
+#auc(fit_1.5.test.roc)
+```
+
+
+### Logistic Regression using LASSO
+
+For our second model, we created another multiple regression model to predict binary shot outcome, this time using LASSO for model selection. Using `lambda.1se`, our LASSO selected the following variables: `CLOSE_DEF_DIST`, `shot_clock_groupings`, `SHOT_DIST`, `TOUCH_TIME`, `player_shot_number_by_game`, `LOCATION`, `fgp_by_shot_updating`, `shot_four_groups`, `PERIOD`, `CLOSE_DEF_DIST`. These variables were shown to have high significance through running ANOVA to get chi-squared tests and corresponding p values. Results were extremely similar to our model created through backwards selection, coefficients of particular interest were `shot_clock_groupings` and `fgp_by_shot_updating`, with the same variables (like `SHOT_DIST` and `TOUCH_TIME` having negative effects on the chance a shot is made.
+
+* **AUC**: 0.648
+* **Misclassification Error**: 0.381
+
+```{r}
+set.seed(1234)
+Y <- data.train[, 16]
+Y <- as.matrix(Y)
+X <- model.matrix(make~. + CLOSE_DEF_DIST:shot_clock_groupings + CLOSE_DEF_DIST:shot_four_groups, data.train)[,-1]
+library(glmnet)
+fit1.cv <- cv.glmnet(X, Y, alpha=1, nfolds = 10, type.measure = "mse")
+plot(fit1.cv)
+coef.1se <- coef(fit1.cv, s="lambda.min")  
+coef.1se <- coef.1se[which(coef.1se !=0),] 
+# coef(fit1.cv)
+LASSO_fit <- glm(make ~ CLOSE_DEF_DIST + shot_clock_groupings + SHOT_DIST + TOUCH_TIME + player_shot_number_by_game + LOCATION + fgp_by_shot_updating + shot_four_groups + PERIOD + CLOSE_DEF_DIST*shot_clock_groupings + CLOSE_DEF_DIST*shot_clock_groupings, data.train, family = "binomial")
+# summary(LASSO_fit)
+# car::Anova(LASSO_fit)
+fit1.test <- predict(LASSO_fit, data.test, type = "response")
+fit1.roc.test<- roc(data.test$make, fit1.test, plot=T, col="blue")
+plot(1-fit1.roc.test$specificities, fit1.roc.test$sensitivities, col="red", pch=16,
+     xlab="False Positive", 
+     ylab="Sensitivity")
+#auc(fit1.roc.test)
+preds <- predict(LASSO_fit, data.test, type = "response")
+actual <- data.test$make
+predictions <- data.frame(preds, actual)
+predictions <- predictions %>%
+  mutate(final_prediction = ifelse(preds >= 0.5, 1, 0))
+#mean(predictions$final_prediction != predictions$actual)
+data.test <- data.test %>%
+  mutate(preds = predict(LASSO_fit, data.test, type = "response")) %>%
+  mutate(actual = data.test$make) %>%
+  mutate(final_prediction = ifelse(preds >= 0.5, 1, 0))
+```
+
+
+## Decision Tree
+
+Overall, a single, pruned decision tree that had 12 end nodes and made split decisions based on the original predictors we included for the logistic regression performed very similarly in terms of its AUC and misclassification error. 
+
+One potential problem we identified was that unless the tree goes very deep and overfits the data heavily, none of the predicted probabilities tend towards zero. In other words, the tree may not be adequately identifying very low-probability attempts. 
+
+We see that the tree makes its first split based on players’ prior field goal percentage. The highest probability bin came when the player had a prior field goal percentage greater than 0.5, the closest defender was further than 4 feet away (giving them nba.com’s wide open classification), and the shot distance was closer than approximately 5.5 feet. 
+
+* **AUC**: 0.64
+* **Testing Error**: 0.381
+* **Training Error**: 0.379
+
+```{r echo=F}
+data.train <- data.train %>%
+  select(-LOC_Y, -LOC_X)
+
+tree_one <- rpart(data = data.train, make ~., cp = 0.0005)
+#rpart.plot(tree_one)
+tree.p <- prune(tree_one, cp = 0.0009)
+rpart.plot(tree.p)
+```
+
+```{r}
+predictions_tree.p <- predict(tree.p, data.test)
+tree_error <- data.frame(predictions_tree.p, data.test$make)
+tree_error <- tree_error %>%
+  mutate(final_prediction = ifelse(predictions_tree.p >= 0.5, 1, 0))
+#mean(tree_error$final_prediction != tree_error$data.test.make)
+
+predictions_tree.p.train <- predict(tree.p, data.train)
+tree_error_train <- data.frame(predictions_tree.p.train, data.train$make)
+tree_error_train <- tree_error_train %>%
+  mutate(final_prediction = ifelse(predictions_tree.p.train >= 0.5, 1, 0))
+#mean(tree_error_train$final_prediction != tree_error_train$data.train.make)
+```
+
+```{r echo=F}
+treep.test <- predict(tree.p, data.test)
+treep.test.roc<- roc(data.test$make, treep.test, plot=T, col="blue")
+# plot(1-treep.test.roc$specificities, treep.test.roc$sensitivities, col="red", pch=16,
+#      xlab="False Positive",
+#      ylab="Sensitivity")
+```
+
+```{r}
+auc(treep.test.roc)
+```
+
+## Random Forest
+
+Ultimately, we decided to use a random forest through the `ranger` package as our final model for predicting shots. It has a slightly higher AUC than the other models we built, a lower misclassification error, and fits the training data extremely well (although this isn’t as significant). We used 250 trees for our model, the default for `mtry` (square root of the number of predictors), and the default splitrule, `gini`. We also ran a loop to try and obtain the testing errors for every possible number of trees, but this took too long to compile, so we commented this section out. This confirmed our usage of 250 trees.
+
+* **AUC**: 0.67 -- Reminder that AUC compares the specificity and sensitivity as we change the threshold or classification rule  
+* **Testing Misclassification Error**: 0.37
+* **OOB Testing Error**: 0.23
+* **Training Misclassification Error**: 0.0009
+
+```{r}
+set.seed(1234)
+ranger_model <- ranger(make~., data.train, num.trees = 250, importance = "impurity")
+rf.range.pred <- predict(ranger_model, data.train, type = "response") 
+
+
+train_error <- data.frame(data.train$make, rf.range.pred$predictions) 
+train_error <- train_error %>%
+  mutate(prediction = ifelse(rf.range.pred.predictions >= 0.5, 1, 0))
+#mean(train_error$data.train.make != train_error$prediction) #training error
+#ranger_model$prediction.error #oob error
+
+predictions_ranger_test <- predict(ranger_model, data.test)
+ranger_error <- data.frame(predictions_ranger_test$predictions, data.test$make)
+ranger_error <- ranger_error %>%
+  mutate(final_prediction = ifelse(predictions_ranger_test.predictions >= 0.5, 1, 0))
+#mean(ranger_error$final_prediction != ranger_error$data.test.make)
+
+ranger.test <- predict(ranger_model, data.test, type = "response")
+ranger.test.roc <- roc(data.test$make, ranger.test$predictions)
+roc_ranger <- plot(1-ranger.test.roc$specificities, ranger.test.roc$sensitivities, col="red", pch=16,
+     xlab="False Positive", 
+     ylab="Sensitivity")
+#auc(ranger.test.roc)
+
+oob_mse <- vector("numeric", 50)
+
+importance <- data.frame(ranger_model$variable.importance)
+importance <- importance %>%
+  mutate(variables = row.names(importance))
+
+# for(i in 1:100){
+#   rf <- ranger(make~., data.train, num.trees = i)
+#   oob_mse[i] <- rf$prediction.error
+# }
+# 
+# plot(x = 1:50, y = oob_mse, col = "red", type = "l")
+
+# set probablity=T to output OOB predicted portion
+# rf.ranger <- ranger(HD~., data2, mtry = 7, 
+#                     num.trees = 250, splitrule = "gini",
+#                     importance = "impurity", probability = T)
+
+
+importance %>%
+ggplot(aes(x=reorder(variables,ranger_model.variable.importance), y=ranger_model.variable.importance,fill=ranger_model.variable.importance))+ 
+      geom_bar(stat="identity", position="dodge")+ coord_flip()+
+      ylab("Variable Importance")+
+      xlab("")+
+      ggtitle("Information Value Summary")+
+      guides(fill=F)+
+      scale_fill_gradient(low="red", high="blue")
+
+```
+
+
+# Predicting Games
+
+All of our models demonstrated that predicting individual shot outcomes is a challenging task. Each model had a fairly high misclassification error and a weaker AUC relative to what we observed in class examples. However, our main hope was that our Random Forest Model would be a strong predictor of shot quality, or expected points, and overall game outcomes!
+
+To test this, we predicted shot probabilities for our cleaned file, `merged_attempt`, that we used to split our data. Because we did a random split, we didn’t solely want to predict outcomes for the testing data. We want to note that this cleaned file, however, doesn’t contain perfect information on every game during the 2014-2015 regular season; our cleaning procedure greatly reduced our number of observations, so many games in this file have very few shot attempts. After making our predictions, we compared the number of total shots attempted by game with this file to the total number of attempts in the original, clean Katherine Evans dataset, and only included games where the discrepancy in total shots was less than ten. This left us with data from 316 games.
+
+In order to find the expected points per game, we multiplied the shot probability by the number of points available on that play (which would be two or three). Then, we grouped by each game and summed up the expected points and true points for both the home and away team. We provide plots comparing the expected points per game and the true number of points scored and the predicted margin of error and the actual margin of error, respectively. Both of these plots have a fairly strong correlation of 0.8.
+
+**Note**: some point totals are very low due to some missing observations in each game, but we made predictions for the shots available to us for these comparisons.
+
+Additionally, our random forest model was able to predict the victor of games correctly 80% of the time, which we consider to be more important than identifying individual shot outcomes correctly.
+
+You can see the predicted home and away point distributions and the corresponding actual home and away point distributions. They are very similar which is encouraging.
+
+To conclude, while our random forest model still had a fairly high misclassification error, it did seem to identify true shot probabilities more accurately as evidenced by the comparison of game-by-game expected points and true points scored. It isn’t necessarily a negative outcome that our model didn’t predict game outcomes correctly;  there could be a large proportion of games in which teams are “hot” and make highly contested shots that are of low quality. This shooting performance likely doesn’t translate game-to-game, and we believe that comparing actual game outcomes to “shot-quality” outcomes would be a truer measurement of team quality or success.
+
+
+```{r}
+merged_attempt$predictions <- predict(ranger_model, data = merged_attempt, type = "response")$prediction
+merged_attempt <- merged_attempt %>%
+  mutate(expected_points = predictions*PTS_TYPE)
+
+counts_original <- evans_2014_updated %>%
+  group_by(GAME_ID) %>%
+  summarize(count = n()) %>%
+  ungroup()
+
+counts <- merged_attempt %>%
+  group_by(GAME_ID) %>%
+  summarize(count = n())  %>%
+  ungroup()
+
+merged_counts <- left_join(counts, counts_original, by = "GAME_ID")
+merged_counts <- merged_counts %>%
+  mutate(diff = count.y - count.x) %>%
+  filter(diff <= 10)
+
+merged_attempt2 <- merged_attempt %>%
+  filter(GAME_ID %in% merged_counts$GAME_ID)
+
+merged_attempt2 <- merged_attempt2 %>%
+  mutate(home = ifelse(HOME_TEAM == SHOOTING_TEAM, 1, 0))
+
+summary <- merged_attempt2 %>%
+  group_by(GAME_ID, SHOOTING_TEAM, home) %>%
+  summarize(actual_points = sum(PTS), sum_expected_points = sum(expected_points))
+
+plot(summary$actual_points, summary$sum_expected_points)
+#cor(summary$actual_points, summary$sum_expected_points)
+
+summary_two <- summary %>%
+   pivot_wider(
+    names_from = c(home), 
+    values_from = c(SHOOTING_TEAM, sum_expected_points, actual_points)
+  )
+
+summary_two <- summary_two %>%
+  rename(home_team = SHOOTING_TEAM_1, away_team = SHOOTING_TEAM_0, home_expected_points = sum_expected_points_1, away_expected_points = sum_expected_points_0, home_actual_points = actual_points_1, away_actual_points = actual_points_0)
+summary_two <- summary_two %>%
+  mutate(diff_actual = home_actual_points - away_actual_points) %>%
+  mutate(diff_expected = home_expected_points - away_expected_points)
+
+# summary_two <- summary_two %>%
+#   filter(home_actual_points >= 70)
+```
+
+```{r}
+plot(summary_two$diff_actual, summary_two$diff_expected)
+#cor(summary_two$diff_actual, summary_two$diff_expected)
+
+plot_actual_home <- summary_two %>%
+  ggplot(aes(x = home_actual_points)) +
+  geom_histogram(color = "dodgerblue", fill = "dodgerblue") +
+  labs(x = "Actual Points Scored by Home Team")
+
+plot_expected_home <- summary_two %>%
+  ggplot(aes(x = home_expected_points)) +
+  geom_histogram(color = "darkblue", fill = "darkblue") +
+  labs(x = "Expected Points Scored by Home Team")
+
+grid.arrange(plot_actual_home, plot_expected_home)
+```
+
+```{r echo=F}
+plot_actual_away <- summary_two %>%
+  ggplot(aes(x = away_actual_points)) +
+  geom_histogram(color = "dodgerblue", fill = "dodgerblue") +
+  labs(x = "Actual Points Scored by Away Team")
+
+plot_expected_away <- summary_two %>%
+  ggplot(aes(x = away_expected_points)) +
+  geom_histogram(color = "darkblue", fill = "darkblue") +
+  labs(x = "Expected Points Scored by away Team")
+
+grid.arrange(plot_actual_home, plot_expected_home, plot_actual_away, plot_expected_away)
+```
+
+```{r}
+summary_two <- summary_two %>%
+  mutate(outcome_matches = ifelse(home_actual_points - away_actual_points >= 0 & home_expected_points - away_expected_points >= 0 | home_actual_points - away_actual_points < 0 & home_expected_points - away_expected_points < 0, 1, 0))
+
+mean(summary_two$outcome_matches) #predicted outcomes correctly 80% of time!!!!
+```
+
+
+# Appendix
+
+## Exploring relationship between `Shot_clock` and `make`
+
+```{r echo=F}
+# simple_tree <- rpart(data = merged_new, make ~ shot_clock_new + CLOSE_DEF_DIST + SHOT_DIST, cp = 0.001)
+# rpart.plot(simple_tree)
+s_tree <- rpart(data = merged_new, make ~ shot_clock_new, cp = 0.001)
+rpart.plot(s_tree)
+```
+
+
+## Shot attempts by all teams in 2014-2015 NBA season
+
+
+```{r echo=F}
+merged_new %>%
+  mutate(make_factor = as.factor(make)) %>%
+  ggplot(aes(x = LOC_X, y = LOC_Y,
+  color = make_factor)) +
+  geom_point(alpha = 0.5) +
+  scale_color_manual(values = c("darkorange", "darkblue")) +
+  theme_bw() +
+  labs(title = "Shot attempts by all teams in 2014-2015 NBA season",
+  caption = "Data accessed via PBP Dataset")
+```
+
+
+## Supplementary EDA Plots
+
+```{r echo=F}
+p <- ggplotly(end_of_q_shots %>%
+  group_by(bins_reversed) %>%
+  summarize(mean_fgp = mean(SHOT_MADE), count = n()) %>%
+  ungroup() %>%
+  ggplot(aes(x = bins_reversed, y = mean_fgp)) +
+  geom_line(aes(group = 1)) +
+  geom_point(aes(size = count)) +
+  theme(axis.text.x = element_text(angle = 60)) +
+  labs(x = "Shot Clock Bins", y = "Field Goal Percentage", title = "League Field Goal Percentage by Shot Clock Bin, End of Quarter"))
+
+p2 <- ggplotly(merged_new %>%
+  filter(!is.na(SHOT_CLOCK)) %>%
+  group_by(bins_reversed) %>%
+  summarize(mean_fgp = mean(SHOT_MADE), count = n()) %>%
+  ungroup() %>%
+  ggplot(aes(x = bins_reversed, y = mean_fgp)) +
+  geom_line(aes(group = 1)) +
+  geom_point(aes(size = count)) +
+  theme(axis.text.x = element_text(angle = 60)) +
+  labs(x = "Shot Clock Bins", y = "Field Goal Percentage", title = "League Field Goal Percentage by Shot Clock Bin"))
+p3 <- ggplotly(merged_new %>%
+  filter(!is.na(SHOT_CLOCK)) %>%
+  group_by(bins_reversed) %>%
+  summarize(mean_fgp = mean(SHOT_MADE), count = n()) %>%
+  ungroup() %>%
+  ggplot(aes(x = bins_reversed, y = mean_fgp)) +
+  geom_line(aes(group = 1)) +
+  geom_point(aes(size = count)) +
+  theme(axis.text.x = element_text(angle = 60)) +
+  labs(x = "Shot Clock Bins", y = "Field Goal Percentage", title = "League Field Goal Percentage by Shot Clock Bin"))
+p
+p2
+p3
+
+ggplotly(merged_new %>%
+  filter(!is.na(SHOT_CLOCK)) %>%
+  filter(SHOT_ZONE_BASIC == "Mid-Range") %>%
+  group_by(bins_reversed) %>%
+  summarize(mean_fgp = mean(SHOT_MADE), count = n()) %>%
+  ungroup() %>%
+  ggplot(aes(x = bins_reversed, y = mean_fgp)) +
+  geom_line(aes(group = 1)) +
+  geom_point(aes(size = count)) +
+  theme(axis.text.x = element_text(angle = 60)) +
+  labs(x = "Shot Clock Bins", y = "Field Goal Percentage", title = "Mid-Range Field Goal Percentage by Shot Clock Bin"))
+
+ggplotly(merged_new %>%
+  filter(!is.na(SHOT_CLOCK)) %>%
+  filter(PTS_TYPE == 3) %>%
+  group_by(bins_reversed) %>%
+  summarize(mean_fgp = mean(SHOT_MADE), count = n()) %>%
+  ungroup() %>%
+  ggplot(aes(x = bins_reversed, y = mean_fgp)) +
+  geom_line(aes(group = 1)) +
+  geom_point(aes(size = count)) +
+  theme(axis.text.x = element_text(angle = 60)) +
+  labs(x = "Shot Clock Bins", y = "Field Goal Percentage", title = "Three-Point Field Goal Percentage by Shot Clock Bin"))
+
+ggplotly(merged_new %>%
+  filter(!is.na(SHOT_CLOCK)) %>%
+  filter(SHOT_DIST <= 8) %>%
+  group_by(bins_reversed) %>%
+  summarize(mean_fgp = mean(SHOT_MADE), count = n()) %>%
+  ungroup() %>%
+  ggplot(aes(x = bins_reversed, y = mean_fgp)) +
+  geom_line(aes(group = 1)) +
+  geom_point(aes(size = count)) +
+  theme(axis.text.x = element_text(angle = 60)) +
+  labs(x = "Shot Clock Bins", y = "Field Goal Percentage", title = "Layup Field Goal Percentage by Shot Clock Bin"))
+```
+
+
+```{r echo=F}
+#plots by team
+ggplotly(merged_new %>%
+  group_by(SHOOTING_TEAM, bins_reversed) %>%
+  summarize(FGP_Per_Bin = mean(make)) %>%
+  ungroup() %>%
+  group_by(bins_reversed) %>%
+  mutate(league_mean = mean(FGP_Per_Bin)) %>%
+  ungroup() %>%
+  ggplot(aes(x = bins_reversed, y = FGP_Per_Bin, color = SHOOTING_TEAM)) +
+  theme(axis.text.x = element_text(angle = 60)) +
+  geom_point(size = 0.2) +
+  geom_line(aes(group = SHOOTING_TEAM)) +
+  labs(x = "Shot Clock Bins", y = "Overall FGP by Team per Shot Clock Interval") +
+  geom_point(aes(x = bins_reversed, y = league_mean), colour = "red"))
+
+ggplotly(merged_new %>% #Counts of shots
+  group_by(SHOOTING_TEAM, bins_reversed) %>%
+  summarize(freq = sum(SHOT_ATTEMPTED_FLAG)) %>%
+  ungroup() %>%
+  group_by(bins_reversed) %>%
+  mutate(league_mean = mean(freq)) %>%
+  ungroup() %>%
+  ggplot(aes(x = bins_reversed, y = freq, color = SHOOTING_TEAM)) +
+  theme(axis.text.x = element_text(angle = 60)) +
+  geom_point(size = 0.2) +
+  geom_line(aes(group = SHOOTING_TEAM)) +
+  labs(x = "Shot Clock Bins", y = "FG Count", title = "Counts of FGA per Shot Clock Bin") +
+  geom_point(aes(x = bins_reversed, y = league_mean), colour = "red"))
+
+ggplotly(merged_new %>%
+  filter(PTS_TYPE == 3) %>%
+  group_by(SHOOTING_TEAM, bins_reversed) %>%
+  summarize(TPP_Per_Bin = mean(make)) %>%
+  ungroup() %>%
+  filter(!is.na(bins_reversed)) %>%
+  group_by(bins_reversed) %>%
+  mutate(league_mean = mean(TPP_Per_Bin)) %>%
+  ungroup() %>%
+  ggplot(aes(x = bins_reversed, y = TPP_Per_Bin, color = SHOOTING_TEAM)) +
+  theme(axis.text.x = element_text(angle = 60)) +
+  geom_point(size = 0.2) +
+  geom_line(aes(group = SHOOTING_TEAM)) +
+  labs(x = "Shot Clock Bins", y = "TPP Per Three Second Shot Clock Interval", title = "Team Three Point Percentage Per Shot Clock Bin") +
+  geom_point(aes(x = bins_reversed, y = league_mean), colour = "red"))
+
+ggplotly(merged_new %>%
+  filter(PTS_TYPE == 3) %>%
+  group_by(SHOOTING_TEAM, bins_reversed) %>%
+  summarize(freq = n()) %>%
+  ungroup() %>%
+  group_by(bins_reversed) %>%
+  mutate(league_mean = mean(freq)) %>%
+  ungroup()%>%
+  ggplot(aes(x = bins_reversed, y = freq, color = SHOOTING_TEAM)) +
+  theme(axis.text.x = element_text(angle = 60)) +
+  geom_point(size = 0.2) +
+  geom_line(aes(group = SHOOTING_TEAM)) +
+  labs(x = "Shot Clock Bins", y = "Three Pt. Count", title = "Counts of TPA per Shot Clock Bin") +
+  geom_point(aes(x = bins_reversed, y = league_mean), colour = "red"))
+```
